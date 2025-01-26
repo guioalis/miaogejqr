@@ -1,0 +1,19 @@
+{
+  "name": "meow-bot",
+  "version": "1.0.0",
+  "description": "Telegram Bot for Group Management with AI capabilities",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev": "nodemon src/bot.js",
+    "healthcheck": "node healthcheck.js"
+  },
+  "dependencies": {
+    "grammy": "^1.x",
+    "node-fetch": "^2.x",
+    "dotenv": "^16.x"
+  },
+  "devDependencies": {
+    "nodemon": "^2.x"
+  }
+} 

@@ -1,0 +1,18 @@
+version: '3'
+name: meow-bot
+services:
+  bot:
+    build: .
+    container_name: meow-bot
+    restart: always
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    name: meow-bot-network 
