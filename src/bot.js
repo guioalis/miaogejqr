@@ -31,6 +31,11 @@ const CONFIG = {
     lottery: {
       price: 10,
       drawTime: 24 * 60 * 60 * 1000 // 24小时
+    },
+    gomoku: {
+      minBet: 10,    // 最小下注
+      maxBet: 100,   // 最大下注
+      boardSize: 10  // 棋盘大小
     }
   },
   points: {
@@ -42,6 +47,26 @@ const CONFIG = {
       bonus: 20, // 连续签到奖励
       maxDays: 7  // 最大连续天数
     }
+  },
+  shop: {
+    items: [
+      { id: "rename", name: "改名卡", price: 100, description: "可以修改自己的昵称" },
+      { id: "title", name: "称号卡", price: 500, description: "可以获得特殊称号" },
+      { id: "vip", name: "VIP会员", price: 1000, description: "获得特殊权限和标识" },
+      { id: "lottery", name: "抽奖券", price: 50, description: "参与每日抽奖" }
+    ]
+  },
+  achievements: {
+    signIn: [
+      { id: "sign_7", name: "初心者", description: "连续签到7天", reward: 100 },
+      { id: "sign_30", name: "坚持不懈", description: "连续签到30天", reward: 500 },
+      { id: "sign_100", name: "签到达人", description: "累计签到100天", reward: 1000 }
+    ],
+    games: [
+      { id: "game_10", name: "游戏新手", description: "参与10次游戏", reward: 100 },
+      { id: "game_win_5", name: "小赢家", description: "获得5次游戏胜利", reward: 200 },
+      { id: "game_master", name: "游戏大师", description: "获得50次游戏胜利", reward: 1000 }
+    ]
   }
 };
 
@@ -158,7 +183,16 @@ function getUserData(userId) {
       lastSign: null,
       signStreak: 0,
       totalSigns: 0,
-      lastChecked: null
+      lastChecked: null,
+      achievements: new Set(), // 已获得的成就
+      inventory: new Map(),   // 物品库存
+      gameStats: {           // 游戏统计
+        totalGames: 0,
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        history: []          // 游戏历史记录
+      }
     });
   }
   return userDatabase.get(userId);
@@ -940,4 +974,585 @@ bot.catch((err) => {
   console.error("Bot error:", err);
 });
 
-bot.start(); 
+bot.start();
+
+// 添加五子棋游戏配置
+CONFIG.games.gomoku = {
+  minBet: 10,    // 最小下注
+  maxBet: 100,   // 最大下注
+  boardSize: 10  // 棋盘大小
+};
+
+// 五子棋游戏状态存储
+const gomokuGames = new Map(); // chatId -> { board, currentPlayer, players, bet, lastMove }
+
+// 创建棋盘
+function createBoard(size) {
+  return Array(size).fill(null).map(() => Array(size).fill(null));
+}
+
+// 检查胜利
+function checkWin(board, row, col, player) {
+  const directions = [
+    [1, 0],   // 水平
+    [0, 1],   // 垂直
+    [1, 1],   // 对角线
+    [1, -1]   // 反对角线
+  ];
+
+  for (const [dx, dy] of directions) {
+    let count = 1;
+    // 正向检查
+    for (let i = 1; i < 5; i++) {
+      const newRow = row + dx * i;
+      const newCol = col + dy * i;
+      if (!isValidPosition(newRow, newCol, board.length) || 
+          board[newRow][newCol] !== player) break;
+      count++;
+    }
+    // 反向检查
+    for (let i = 1; i < 5; i++) {
+      const newRow = row - dx * i;
+      const newCol = col - dy * i;
+      if (!isValidPosition(newRow, newCol, board.length) || 
+          board[newRow][newCol] !== player) break;
+      count++;
+    }
+    if (count >= 5) return true;
+  }
+  return false;
+}
+
+// 检查位置是否有效
+function isValidPosition(row, col, size) {
+  return row >= 0 && row < size && col >= 0 && col < size;
+}
+
+// 生成棋盘显示
+function renderBoard(board) {
+  const symbols = {
+    null: '⬜',
+    'X': '⭕',
+    'O': '❌'
+  };
+  
+  let display = '五子棋对战：\n\n';
+  // 添加列标记
+  display += '  ' + [...Array(board.length)].map((_, i) => String.fromCharCode(65 + i)).join(' ') + '\n';
+  
+  board.forEach((row, i) => {
+    // 添加行号
+    display += `${(i + 1).toString().padStart(2, ' ')} `;
+    display += row.map(cell => symbols[cell]).join('');
+    display += '\n';
+  });
+  return display;
+}
+
+// 开始五子棋游戏
+bot.command("gomoku", async (ctx) => {
+  const chatId = ctx.chat.id;
+  if (gomokuGames.has(chatId)) {
+    return ctx.reply("喵~ 当前已有游戏在进行中！");
+  }
+
+  const args = ctx.message.text.split(" ");
+  const bet = parseInt(args[1]) || CONFIG.games.gomoku.minBet;
+
+  if (bet < CONFIG.games.gomoku.minBet || bet > CONFIG.games.gomoku.maxBet) {
+    return ctx.reply(`喵~ 下注金额必须在 ${CONFIG.games.gomoku.minBet} 到 ${CONFIG.games.gomoku.maxBet} 之间！`);
+  }
+
+  const userData = getUserData(ctx.from.id);
+  if (userData.points < bet) {
+    return ctx.reply("喵~ 积分不足！");
+  }
+
+  const keyboard = new InlineKeyboard()
+    .text("加入游戏", `join_gomoku_${bet}`);
+
+  const gameState = {
+    board: createBoard(CONFIG.games.gomoku.boardSize),
+    players: [ctx.from.id],
+    currentPlayer: 0,
+    bet,
+    lastMove: null,
+    message: await ctx.reply(
+      `${ctx.from.first_name} 发起了五子棋对战！\n` +
+      `下注金额：${bet} 积分\n` +
+      `等待对手加入...`,
+      { reply_markup: keyboard }
+    )
+  };
+
+  gomokuGames.set(chatId, gameState);
+  userData.points -= bet;
+});
+
+// 加入五子棋游戏
+bot.callbackQuery(/^join_gomoku_(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat.id;
+  const gameState = gomokuGames.get(chatId);
+  const bet = parseInt(ctx.match[1]);
+
+  if (!gameState) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 游戏已经结束了！",
+      show_alert: true
+    });
+  }
+
+  if (gameState.players[0] === ctx.from.id) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 不能和自己对战哦！",
+      show_alert: true
+    });
+  }
+
+  if (gameState.players.length >= 2) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 游戏已经开始了！",
+      show_alert: true
+    });
+  }
+
+  const userData = getUserData(ctx.from.id);
+  if (userData.points < bet) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 积分不足！",
+      show_alert: true
+    });
+  }
+
+  userData.points -= bet;
+  gameState.players.push(ctx.from.id);
+
+  // 创建游戏按钮
+  const keyboard = createGomokuKeyboard(gameState.board);
+
+  await ctx.editMessageText(
+    `游戏开始！\n` +
+    `⭕ 玩家1：${(await ctx.api.getChat(gameState.players[0])).first_name}\n` +
+    `❌ 玩家2：${ctx.from.first_name}\n` +
+    `下注金额：${bet} 积分\n\n` +
+    renderBoard(gameState.board),
+    { reply_markup: keyboard }
+  );
+
+  await ctx.answerCallbackQuery({
+    text: "游戏开始！你是 ❌",
+    show_alert: true
+  });
+});
+
+// 创建五子棋键盘
+function createGomokuKeyboard(board) {
+  const keyboard = new InlineKeyboard();
+  
+  for (let i = 0; i < board.length; i++) {
+    for (let j = 0; j < board[i].length; j++) {
+      keyboard.text(
+        board[i][j] || '·',
+        `gomoku_${i}_${j}`
+      );
+      if (j < board[i].length - 1) keyboard.text(' ', `gomoku_space`);
+    }
+    keyboard.row();
+  }
+  
+  return keyboard;
+}
+
+// 处理五子棋落子
+bot.callbackQuery(/^gomoku_(\d+)_(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat.id;
+  const gameState = gomokuGames.get(chatId);
+  
+  if (!gameState) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 游戏已经结束了！",
+      show_alert: true
+    });
+  }
+
+  const playerIndex = gameState.players.indexOf(ctx.from.id);
+  if (playerIndex === -1) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 你不是游戏玩家！",
+      show_alert: true
+    });
+  }
+
+  if (playerIndex !== gameState.currentPlayer) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 还没到你的回合！",
+      show_alert: true
+    });
+  }
+
+  const row = parseInt(ctx.match[1]);
+  const col = parseInt(ctx.match[2]);
+
+  if (gameState.board[row][col] !== null) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 这个位置已经有棋子了！",
+      show_alert: true
+    });
+  }
+
+  // 落子
+  gameState.board[row][col] = playerIndex === 0 ? 'X' : 'O';
+  gameState.lastMove = [row, col];
+
+  // 检查胜利
+  if (checkWin(gameState.board, row, col, gameState.board[row][col])) {
+    const winner = await ctx.api.getChat(gameState.players[playerIndex]);
+    const loser = await ctx.api.getChat(gameState.players[1 - playerIndex]);
+    
+    // 结算积分
+    const winnerData = getUserData(gameState.players[playerIndex]);
+    winnerData.points += gameState.bet * 2;
+
+    await ctx.editMessageText(
+      `游戏结束！\n` +
+      `获胜者：${winner.first_name} (${gameState.board[row][col]})\n` +
+      `获得积分：${gameState.bet * 2}\n\n` +
+      renderBoard(gameState.board)
+    );
+
+    gomokuGames.delete(chatId);
+    return;
+  }
+
+  // 检查平局
+  if (gameState.board.every(row => row.every(cell => cell !== null))) {
+    // 返还积分
+    gameState.players.forEach(playerId => {
+      const userData = getUserData(playerId);
+      userData.points += gameState.bet;
+    });
+
+    await ctx.editMessageText(
+      `游戏结束！\n平局！\n积分已返还！\n\n` +
+      renderBoard(gameState.board)
+    );
+
+    gomokuGames.delete(chatId);
+    return;
+  }
+
+  // 切换玩家
+  gameState.currentPlayer = 1 - gameState.currentPlayer;
+  const nextPlayer = await ctx.api.getChat(gameState.players[gameState.currentPlayer]);
+
+  await ctx.editMessageText(
+    `当前回合：${nextPlayer.first_name} (${gameState.currentPlayer === 0 ? '⭕' : '❌'})\n` +
+    `最后落子：${String.fromCharCode(65 + col)}${row + 1}\n\n` +
+    renderBoard(gameState.board),
+    { reply_markup: createGomokuKeyboard(gameState.board) }
+  );
+
+  await ctx.answerCallbackQuery();
+});
+
+// 添加定时签到提醒
+setInterval(async () => {
+  const now = new Date();
+  const hour = now.getHours();
+  
+  // 每天早上8点和晚上8点提醒
+  if (hour === 8 || hour === 20) {
+    for (const [userId, userData] of userDatabase.entries()) {
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      
+      if (userData.lastChecked !== today && userData.lastSign !== today) {
+        try {
+          await bot.api.sendMessage(userId,
+            "喵~ 记得来签到领取积分哦！\n" +
+            "使用 /sign 命令即可签到~"
+          );
+          userData.lastChecked = today;
+        } catch (error) {
+          console.error(`发送签到提醒失败: ${userId}`, error);
+        }
+      }
+    }
+  }
+}, 60 * 60 * 1000); // 每小时检查一次
+
+// 完善排行榜功能
+bot.callbackQuery("leaderboard", async (ctx) => {
+  await ctx.answerCallbackQuery();
+
+  const sortedUsers = Array.from(userDatabase.entries())
+    .sort(([, a], [, b]) => b.points - a.points)
+    .slice(0, 10);
+
+  let message = "🏆 积分排行榜 TOP 10\n\n";
+  
+  for (let i = 0; i < sortedUsers.length; i++) {
+    const [userId, data] = sortedUsers[i];
+    try {
+      const user = await ctx.api.getChat(userId);
+      const medal = i < 3 ? ["🥇", "🥈", "🥉"][i] : "🏅";
+      message += `${medal} ${user.first_name}\n`;
+      message += `   积分：${data.points}\n`;
+      message += `   连续签到：${data.signStreak}天\n`;
+      message += `   累计签到：${data.totalSigns}天\n`;
+      if (i < sortedUsers.length - 1) message += "\n";
+    } catch (error) {
+      console.error(`获取用户信息失败: ${userId}`, error);
+    }
+  }
+
+  // 添加查看者的排名信息
+  const userRank = Array.from(userDatabase.entries())
+    .sort(([, a], [, b]) => b.points - a.points)
+    .findIndex(([id]) => id === ctx.from.id) + 1;
+
+  if (userRank > 0) {
+    const userData = getUserData(ctx.from.id);
+    message += "\n━━━━━━━━━━\n";
+    message += `你的排名：第${userRank}名\n`;
+    message += `你的积分：${userData.points}\n`;
+    message += `连续签到：${userData.signStreak}天\n`;
+    message += `累计签到：${userData.totalSigns}天`;
+  }
+
+  const keyboard = new InlineKeyboard()
+    .text("📝 去签到", "sign_reminder")
+    .text("🎮 玩游戏", "games")
+    .row()
+    .text("🔄 刷新排行榜", "leaderboard");
+
+  await ctx.editMessageText(message, { reply_markup: keyboard });
+});
+
+// 添加游戏历史记录
+function addGameHistory(userId, gameType, result, points, opponent = null) {
+  const userData = getUserData(userId);
+  const history = {
+    type: gameType,
+    result: result,
+    points: points,
+    opponent: opponent,
+    timestamp: Date.now()
+  };
+  
+  userData.gameStats.history.unshift(history);
+  // 只保留最近50条记录
+  if (userData.gameStats.history.length > 50) {
+    userData.gameStats.history.pop();
+  }
+  
+  // 更新游戏统计
+  userData.gameStats.totalGames++;
+  if (result === 'win') userData.gameStats.wins++;
+  else if (result === 'loss') userData.gameStats.losses++;
+  else userData.gameStats.draws++;
+  
+  // 检查游戏相关成就
+  checkGameAchievements(userId);
+}
+
+// 检查游戏成就
+async function checkGameAchievements(userId) {
+  const userData = getUserData(userId);
+  const stats = userData.gameStats;
+  
+  for (const achievement of CONFIG.achievements.games) {
+    if (userData.achievements.has(achievement.id)) continue;
+    
+    let achieved = false;
+    switch (achievement.id) {
+      case 'game_10':
+        achieved = stats.totalGames >= 10;
+        break;
+      case 'game_win_5':
+        achieved = stats.wins >= 5;
+        break;
+      case 'game_master':
+        achieved = stats.wins >= 50;
+        break;
+    }
+    
+    if (achieved) {
+      userData.achievements.add(achievement.id);
+      userData.points += achievement.reward;
+      try {
+        await bot.api.sendMessage(userId,
+          `🏆 恭喜获得成就：${achievement.name}\n` +
+          `描述：${achievement.description}\n` +
+          `奖励：${achievement.reward} 积分\n\n` +
+          `继续加油哦！喵~`
+        );
+      } catch (error) {
+        console.error("发送成就通知失败:", error);
+      }
+    }
+  }
+}
+
+// 添加积分商城命令
+bot.callbackQuery("shop", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  
+  const userId = ctx.from.id;
+  const userData = getUserData(userId);
+  
+  let message = "🏪 积分商城\n\n";
+  message += `当前积分：${userData.points}\n\n`;
+  
+  CONFIG.shop.items.forEach(item => {
+    const owned = userData.inventory.get(item.id) || 0;
+    message += `${item.name} - ${item.price} 积分\n`;
+    message += `描述：${item.description}\n`;
+    message += `拥有数量：${owned}\n\n`;
+  });
+  
+  const keyboard = new InlineKeyboard();
+  CONFIG.shop.items.forEach(item => {
+    keyboard.text(`购买 ${item.name}`, `buy_${item.id}`);
+    keyboard.row();
+  });
+  keyboard.text("📦 我的物品", "inventory");
+  
+  await ctx.editMessageText(message, { reply_markup: keyboard });
+});
+
+// 处理购买请求
+bot.callbackQuery(/^buy_(.+)$/, async (ctx) => {
+  const itemId = ctx.match[1];
+  const userId = ctx.from.id;
+  const userData = getUserData(userId);
+  
+  const item = CONFIG.shop.items.find(i => i.id === itemId);
+  if (!item) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 这个商品不存在！",
+      show_alert: true
+    });
+  }
+  
+  if (userData.points < item.price) {
+    return ctx.answerCallbackQuery({
+      text: "喵~ 积分不足！",
+      show_alert: true
+    });
+  }
+  
+  userData.points -= item.price;
+  userData.inventory.set(itemId, (userData.inventory.get(itemId) || 0) + 1);
+  
+  await ctx.answerCallbackQuery({
+    text: `购买成功！已获得 ${item.name}`,
+    show_alert: true
+  });
+  
+  // 刷新商城界面
+  await ctx.editMessageText(
+    `购买成功！\n` +
+    `商品：${item.name}\n` +
+    `花费：${item.price} 积分\n` +
+    `剩余积分：${userData.points}`,
+    { reply_markup: new InlineKeyboard().text("返回商城", "shop") }
+  );
+});
+
+// 查看物品库存
+bot.callbackQuery("inventory", async (ctx) => {
+  const userId = ctx.from.id;
+  const userData = getUserData(userId);
+  
+  let message = "📦 我的物品\n\n";
+  let hasItems = false;
+  
+  for (const [itemId, count] of userData.inventory.entries()) {
+    if (count > 0) {
+      hasItems = true;
+      const item = CONFIG.shop.items.find(i => i.id === itemId);
+      message += `${item.name} x${count}\n`;
+      message += `描述：${item.description}\n\n`;
+    }
+  }
+  
+  if (!hasItems) {
+    message += "还没有购买任何物品哦~";
+  }
+  
+  const keyboard = new InlineKeyboard()
+    .text("🏪 返回商城", "shop")
+    .text("📊 查看成就", "achievements");
+  
+  await ctx.editMessageText(message, { reply_markup: keyboard });
+});
+
+// 查看成就
+bot.callbackQuery("achievements", async (ctx) => {
+  const userId = ctx.from.id;
+  const userData = getUserData(userId);
+  
+  let message = "🏆 成就系统\n\n";
+  
+  // 签到成就
+  message += "📅 签到成就：\n";
+  for (const achievement of CONFIG.achievements.signIn) {
+    const achieved = userData.achievements.has(achievement.id);
+    message += `${achieved ? '✅' : '❌'} ${achievement.name}\n`;
+    message += `   ${achievement.description}\n`;
+    message += `   奖励：${achievement.reward} 积分\n\n`;
+  }
+  
+  // 游戏成就
+  message += "🎮 游戏成就：\n";
+  for (const achievement of CONFIG.achievements.games) {
+    const achieved = userData.achievements.has(achievement.id);
+    message += `${achieved ? '✅' : '❌'} ${achievement.name}\n`;
+    message += `   ${achievement.description}\n`;
+    message += `   奖励：${achievement.reward} 积分\n\n`;
+  }
+  
+  // 游戏统计
+  message += "📊 游戏统计：\n";
+  message += `总场次：${userData.gameStats.totalGames}\n`;
+  message += `胜利：${userData.gameStats.wins}\n`;
+  message += `失败：${userData.gameStats.losses}\n`;
+  message += `平局：${userData.gameStats.draws}\n`;
+  
+  const keyboard = new InlineKeyboard()
+    .text("📜 游戏历史", "game_history")
+    .text("🏪 商城", "shop");
+  
+  await ctx.editMessageText(message, { reply_markup: keyboard });
+});
+
+// 查看游戏历史
+bot.callbackQuery("game_history", async (ctx) => {
+  const userId = ctx.from.id;
+  const userData = getUserData(userId);
+  
+  let message = "📜 最近游戏记录\n\n";
+  
+  if (userData.gameStats.history.length === 0) {
+    message += "还没有游戏记录哦~";
+  } else {
+    for (const record of userData.gameStats.history.slice(0, 10)) {
+      const date = new Date(record.timestamp).toLocaleString('zh-CN');
+      message += `${date}\n`;
+      message += `游戏：${record.type}\n`;
+      message += `结果：${record.result === 'win' ? '胜利 🏆' : 
+                        record.result === 'loss' ? '失败 💔' : '平局 🤝'}\n`;
+      message += `积分：${record.points > 0 ? '+' : ''}${record.points}\n`;
+      if (record.opponent) {
+        message += `对手：${record.opponent}\n`;
+      }
+      message += '\n';
+    }
+  }
+  
+  const keyboard = new InlineKeyboard()
+    .text("🏆 查看成就", "achievements")
+    .text("🎮 玩游戏", "games");
+  
+  await ctx.editMessageText(message, { reply_markup: keyboard });
+}); 
